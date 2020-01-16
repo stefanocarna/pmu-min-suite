@@ -63,12 +63,14 @@ static int switch_post_handler(struct kretprobe_instance *ri, struct pt_regs *re
 
 	
 switch_in:
+	
+	if (!hook_enabled)
+		pr_info("[CPU %u] LAST %u - CURRENT %u\n", cpu, last_scheduled, current->pid);
+
 	last_scheduled = current->pid;
 
 	if (!hook_enabled)
 		goto end;
-
-	pr_info("[CPU %u] LAST %u - CURRENT %u\n", cpu, last_scheduled, current->pid);
 
 	// TODO WARNING the function can be executed while it's being unregistered
 	if (is_pid_present(current->pid)) {
