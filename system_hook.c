@@ -67,7 +67,7 @@ switch_in:
 	if (hook_enabled)
 		pr_info("[CPU %u] LAST %u - CURRENT %u\n", cpu, last_scheduled, current->pid);
 
-	last_scheduled = current->pid;
+	this_cpu_write(pcpu_last_scheduled, current->pid);
 
 	if (!hook_enabled)
 		goto end;
