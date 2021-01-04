@@ -1,20 +1,21 @@
 #ifndef _SWITCH_HOOK_H
 #define _SWITCH_HOOK_H
 
-#define SWITCH_PRE_FUNC "perf_event_task_sched_out"
 #define SWITCH_POST_FUNC "finish_task_switch"
 
-typedef void h_func(void);
+typedef void ctx_func(struct task_struct *prev, bool prev_on, bool curr_on);
 
-struct hook_pair {
-	h_func *func_pos;
-	h_func *func_neg;
-};
+extern struct hook_pair registred_hooks;
 
 extern void switch_hook_pause(void);
 
 extern void switch_hook_resume(void);
 
-extern int hook_register(struct hook_pair *hooks);
+extern void switch_hook_set_mode(unsigned mode);
+
+extern int hook_register(ctx_func *hook);
+
+// TODO inc the refcount
+extern void hook_unregister(void);
 
 #endif /* _SWITCH_HOOK_H */

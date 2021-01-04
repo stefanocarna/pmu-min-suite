@@ -1,14 +1,18 @@
 #include <linux/kprobes.h>
+#include <linux/refcount.h>
 
 #include "ptracker.h"
 #include "system_hook.h"
 
-static int system_hooked = 0;
-static int hook_enabled = 0;
+static bool system_hooked = 0;
+static bool hook_enabled = 0;
+static bool system_wide_mode = 0;
 
-static DEFINE_PER_CPU(pid_t, pcpu_last_scheduled) = 0;
+/* Basic implementation of safe-unmount */
+static refcount_t usage = REFCOUNT_INIT(1);
+static refcount_t unmounting = REFCOUNT_INIT(1);
 
-static struct hook_pair registred_hooks = {0, 0};
+static unsigned long *ctx_hook = NULL;
 
 void switch_hook_pause(void)
 {
@@ -22,65 +26,93 @@ void switch_hook_resume(void)
 }
 EXPORT_SYMBOL(switch_hook_resume);
 
-int hook_register(struct hook_pair *hooks)
+void switch_hook_set_mode(unsigned mode)
+{
+	system_wide_mode = !!mode;
+}
+EXPORT_SYMBOL(switch_hook_set_mode);
+
+int hook_register(ctx_func hook)
 {
 	int err = 0;
 
-	if (!hooks) {
+	if (!hook) {
 		err = -1;
 		goto end;
 	}
 
-	registred_hooks.func_pos = hooks->func_pos;
-	registred_hooks.func_neg = hooks->func_neg;
+	ctx_hook = (unsigned long *)hook;
 
 end:
 	return err;
 }
 EXPORT_SYMBOL(hook_register);
 
-
-static int switch_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs);
-
-
-static struct kretprobe krp_post = {
-	.handler = switch_post_handler,
-};
-
-
-static int switch_post_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+void hook_unregister(void)
 {
-	pid_t last_scheduled;
-	unsigned cpu = get_cpu();
+	/* Already unregistrering */
+	if (!refcount_inc_not_zero(&unmounting))
+		return;
 
-	last_scheduled = this_cpu_read(pcpu_last_scheduled);
+	/*
+	 * Grace period. This may waste several cpu cycles,
+	 * but it will complete eventually.
+	 */
+	while (refcount_read(&usage) > 1)
+		;
+}
+EXPORT_SYMBOL(hook_unregister);
 
-	if (unlikely(last_scheduled <= 0)) {
-		goto switch_in;
-	}
+static int finish_task_switch_handler(struct kretprobe_instance *ri,
+				      struct pt_regs *regs);
+static int finish_task_switch_entry_handler(struct kretprobe_instance *ri,
+					    struct pt_regs *regs);
 
-	// TODO compute here the last process' data
+static struct kretprobe krp_post = { .handler = finish_task_switch_handler,
+				     .entry_handler =
+					     finish_task_switch_entry_handler,
+				     .data_size = sizeof(struct task_struct *),
+				     .maxactive = 8 + 1 };
 
-	
-switch_in:
-	
-	if (hook_enabled)
-		pr_info("[CPU %u] LAST %u - CURRENT %u\n", cpu, last_scheduled, current->pid);
+static int finish_task_switch_entry_handler(struct kretprobe_instance *ri,
+					    struct pt_regs *regs)
+{
+	unsigned long *prev_address = (unsigned long *)ri->data;
 
-	this_cpu_write(pcpu_last_scheduled, current->pid);
+	/* Take the reference to prev task */
+	*prev_address = regs->di;
+	return 0;
+}
+
+static int finish_task_switch_handler(struct kretprobe_instance *ri,
+				      struct pt_regs *regs)
+{
+	struct task_struct *prev =
+		(struct task_struct *)*((unsigned long *)ri->data);
+	preempt_disable();
+
+	/* Set the usage reference */
+	refcount_inc(&usage);
+
+	/* Skip if unmounting */
+	if (refcount_read(&unmounting) > 1)
+		goto end;
 
 	if (!hook_enabled)
 		goto end;
 
-	// TODO WARNING the function can be executed while it's being unregistered
-	if (is_pid_present(current->pid)) {
-		if (registred_hooks.func_pos) ((h_func*) registred_hooks.func_pos)();
+	if (system_wide_mode) {
+		if (ctx_hook)
+			((ctx_func *)ctx_hook)(prev, true, true);
 	} else {
-		if (registred_hooks.func_neg) ((h_func*) registred_hooks.func_neg)();
+		if (ctx_hook)
+			((ctx_func *)ctx_hook)(prev, is_pid_tracked(prev->tgid),
+					       is_pid_tracked(current->tgid));
 	}
 
 end:
-	put_cpu();
+	refcount_dec(&usage);
+	preempt_enable();
 	return 0;
 }
 
@@ -114,17 +146,20 @@ static void __exit switch_hook_module_exit(void)
 		return;
 	}
 
+	hook_unregister();
+
 	tracker_fini();
 
 	unregister_kretprobe(&krp_post);
 
 	/* nmissed > 0 suggests that maxactive was set too low. */
-	if (krp_post.nmissed) pr_info("Missed %u invocations\n", krp_post.nmissed);
+	if (krp_post.nmissed)
+		pr_info("Missed %u invocations\n", krp_post.nmissed);
 
 	system_hooked = 0;
 
 	pr_info("SHOOK module shutdown\n");
-}// hook_exit
+}
 
 module_init(switch_hook_module_init);
 module_exit(switch_hook_module_exit);
