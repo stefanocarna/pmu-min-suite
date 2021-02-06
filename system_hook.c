@@ -133,7 +133,7 @@ static __init int switch_hook_module_init(void)
 
 	tracker_init();
 
-	pr_info("SHOOK module loaded\n");
+	pr_info("module loaded\n");
 
 post_err:
 	return err;
@@ -158,7 +158,7 @@ static void __exit switch_hook_module_exit(void)
 
 	system_hooked = 0;
 
-	pr_info("SHOOK module shutdown\n");
+	pr_info("module shutdown\n");
 }
 
 module_init(switch_hook_module_init);

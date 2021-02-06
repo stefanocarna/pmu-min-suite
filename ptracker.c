@@ -23,9 +23,11 @@ smp_call_func_t exit_callback = smp_dummy;
 
 void set_exit_callback(smp_call_func_t callback)
 {
-	spin_lock(&lock);
+	unsigned long flags;
+
+	spin_lock_irqsave(&lock, flags);
 	exit_callback = callback ? callback : smp_dummy;
-	spin_unlock(&lock);
+	spin_unlock_irqrestore(&lock, flags);
 }
 EXPORT_SYMBOL(set_exit_callback);
 
@@ -61,14 +63,15 @@ static struct kretprobe krp_exit = {
 
 int pid_register(pid_t pid)
 {
+	unsigned long flags;
 	struct tracked_process *tp;
 	tp = kmalloc(sizeof(struct tracked_process), GFP_KERNEL);
 	tp->pid = pid;
 
-	spin_lock(&lock);
+	spin_lock_irqsave(&lock, flags);
 	list_add(&tp->list, &tracked_list);
 	tracked_count++;
-	spin_unlock(&lock);
+	spin_unlock_irqrestore(&lock, flags);
 
 	pr_info("Registered pid %u, current: %u (TGID %u)\n", pid, current->pid,
 		current->tgid);
@@ -79,11 +82,12 @@ EXPORT_SYMBOL(pid_register);
 
 int pid_unregister(pid_t pid)
 {
+	unsigned long flags;
 	struct list_head *p;
 	struct tracked_process *tp;
 	bool last_tracked = false;
 
-	spin_lock(&lock);
+	spin_lock_irqsave(&lock, flags);
 	list_for_each (p, &tracked_list) {
 		tp = list_entry(p, struct tracked_process, list);
 		if (tp->pid == pid) {
@@ -96,7 +100,7 @@ int pid_unregister(pid_t pid)
 		}
 	}
 end:
-	spin_unlock(&lock);
+	spin_unlock_irqrestore(&lock, flags);
 
 	if (last_tracked)
 		exit_callback(NULL);
@@ -106,18 +110,19 @@ EXPORT_SYMBOL(pid_unregister);
 
 bool is_pid_tracked(pid_t pid)
 {
+	unsigned long flags;
 	struct list_head *p;
 	struct tracked_process *tp;
 
-	spin_lock(&lock);
+	spin_lock_irqsave(&lock, flags);
 	list_for_each (p, &tracked_list) {
 		tp = list_entry(p, struct tracked_process, list);
 		if (tp->pid == pid) {
-			spin_unlock(&lock);
+			spin_unlock_irqrestore(&lock, flags);
 			return true;
 		}
 	}
-	spin_unlock(&lock);
+	spin_unlock_irqrestore(&lock, flags);
 	return false;
 }
 EXPORT_SYMBOL(is_pid_tracked);
@@ -153,7 +158,7 @@ int tracker_init(void)
 		goto end;
 	}
 
-	pr_info("Tracker correctly initialized\n");
+	pr_info("tracker ready\n");
 
 end:
 	return err;
@@ -164,5 +169,5 @@ void tracker_fini(void)
 	unregister_kretprobe(&krp_exit);
 	unregister_kretprobe(&krp_fork);
 
-	pr_info("Tracker correctly uninstalled\n");
+	pr_info("tracker uninstalled\n");
 }

@@ -1,6 +1,11 @@
 #ifndef _SWITCH_HOOK_H
 #define _SWITCH_HOOK_H
 
+#define MODNAME	"SHook"
+
+#undef pr_fmt
+#define pr_fmt(fmt) MODNAME ": " fmt
+
 #define SWITCH_POST_FUNC "finish_task_switch"
 
 typedef void ctx_func(struct task_struct *prev, bool prev_on, bool curr_on);
