@@ -4,77 +4,34 @@
 #include "ptracker.h"
 #include "system_hook.h"
 
-static bool system_hooked = 0;
-static bool hook_enabled = 0;
-static bool system_wide_mode = 0;
+static bool shook_initialized = false;
+static bool shook_enabled = false;
+static bool system_wide_mode = false;
 
 /* Basic implementation of safe-unmount */
 static refcount_t usage = REFCOUNT_INIT(1);
 static refcount_t unmounting = REFCOUNT_INIT(1);
 
-static unsigned long *ctx_hook = NULL;
-
-void switch_hook_pause(void)
+static void dummy_ctx_func(struct task_struct *prev, bool prev_on, bool curr_on)
 {
-	hook_enabled = 0;
+	// Empty call
 }
-EXPORT_SYMBOL(switch_hook_pause);
 
-void switch_hook_resume(void)
+static unsigned long *ctx_hook = (unsigned long *)dummy_ctx_func;
+
+void switch_hook_set_state_enable(bool state)
 {
-	hook_enabled = 1;
+	shook_enabled = state;
 }
-EXPORT_SYMBOL(switch_hook_resume);
+EXPORT_SYMBOL(switch_hook_set_state_enable);
 
-void switch_hook_set_mode(unsigned mode)
+void switch_hook_set_system_wide_mode(bool mode)
 {
-	system_wide_mode = !!mode;
+	system_wide_mode = mode;
 }
-EXPORT_SYMBOL(switch_hook_set_mode);
+EXPORT_SYMBOL(switch_hook_set_system_wide_mode);
 
-int hook_register(ctx_func hook)
-{
-	int err = 0;
-
-	if (!hook) {
-		err = -1;
-		goto end;
-	}
-
-	ctx_hook = (unsigned long *)hook;
-
-end:
-	return err;
-}
-EXPORT_SYMBOL(hook_register);
-
-void hook_unregister(void)
-{
-	/* Already unregistrering */
-	if (!refcount_inc_not_zero(&unmounting))
-		return;
-
-	/*
-	 * Grace period. This may waste several cpu cycles,
-	 * but it will complete eventually.
-	 */
-	while (refcount_read(&usage) > 1)
-		;
-}
-EXPORT_SYMBOL(hook_unregister);
-
-static int finish_task_switch_handler(struct kretprobe_instance *ri,
-				      struct pt_regs *regs);
-static int finish_task_switch_entry_handler(struct kretprobe_instance *ri,
-					    struct pt_regs *regs);
-
-static struct kretprobe krp_post = { .handler = finish_task_switch_handler,
-				     .entry_handler =
-					     finish_task_switch_entry_handler,
-				     .data_size = sizeof(struct task_struct *),
-				     .maxactive = 8 + 1 };
-
-static int finish_task_switch_entry_handler(struct kretprobe_instance *ri,
+static int context_switch_entry_handler(struct kretprobe_instance *ri,
 					    struct pt_regs *regs)
 {
 	unsigned long *prev_address = (unsigned long *)ri->data;
@@ -84,37 +41,58 @@ static int finish_task_switch_entry_handler(struct kretprobe_instance *ri,
 	return 0;
 }
 
-static int finish_task_switch_handler(struct kretprobe_instance *ri,
+static int context_switch_handler(struct kretprobe_instance *ri,
 				      struct pt_regs *regs)
 {
 	struct task_struct *prev =
 		(struct task_struct *)*((unsigned long *)ri->data);
-	preempt_disable();
 
-	/* Set the usage reference */
-	refcount_inc(&usage);
+	if (!shook_enabled)
+		goto end;
 
 	/* Skip if unmounting */
 	if (refcount_read(&unmounting) > 1)
 		goto end;
 
-	if (!hook_enabled)
-		goto end;
+	preempt_disable();
+	refcount_inc(&usage);
 
 	if (system_wide_mode) {
-		if (ctx_hook)
-			((ctx_func *)ctx_hook)(prev, true, true);
+		((ctx_func *)ctx_hook)(prev, true, true);
+	} else if (use_pid_register_id) {
+		((ctx_func *)ctx_hook)(prev, query_tracker(prev->pid),
+				       query_tracker(current->pid));
 	} else {
-		if (ctx_hook)
-			((ctx_func *)ctx_hook)(prev, is_pid_tracked(prev->tgid),
-					       is_pid_tracked(current->tgid));
+		((ctx_func *)ctx_hook)(prev, query_tracker(prev->pid),
+				       query_tracker(current->pid));
 	}
 
-end:
 	refcount_dec(&usage);
 	preempt_enable();
+end:
 	return 0;
 }
+
+static struct kretprobe krp_post = { .handler = context_switch_handler,
+				     .entry_handler =
+					     context_switch_entry_handler,
+				     .data_size = sizeof(struct task_struct *),
+				     .maxactive = 8 + 1 };
+
+/**
+ * TODO - Redefine 
+ * This is an unsafe way to set the callback
+ */
+void set_hook_callback(ctx_func *hook)
+{
+	if (!hook) {
+		pr_warn("Hook is NULL. Setting default callback\n");
+		ctx_hook = (unsigned long *)dummy_ctx_func;
+	} else {
+		ctx_hook = (unsigned long *)hook;
+	}
+}
+EXPORT_SYMBOL(set_hook_callback);
 
 static __init int switch_hook_module_init(void)
 {
@@ -129,11 +107,19 @@ static __init int switch_hook_module_init(void)
 		goto post_err;
 	};
 
-	system_hooked = 1;
+	err = tracker_init();
+	if (err) {
+		pr_warn("Cannot init tracker - ERR_CODE: %d\n", err);
+		goto tracker_err;
+	};
 
-	tracker_init();
+	shook_initialized = 1;
 
-	pr_info("module loaded\n");
+	pr_info("Module loaded\n");
+	return 0;
+
+tracker_err:
+	unregister_kretprobe(&krp_post);
 
 post_err:
 	return err;
@@ -141,12 +127,24 @@ post_err:
 
 static void __exit switch_hook_module_exit(void)
 {
-	if (!system_hooked) {
-		pr_info("The system is not hooked\n");
+	if (!shook_initialized) {
+		pr_err("Whoops. The system is not hooked\n");
 		return;
 	}
 
-	hook_unregister();
+	if (!refcount_inc_not_zero(&unmounting)) {
+		pr_err("Whoops. Module exit already called\n");
+		return;
+	}
+	
+	shook_enabled = 0;
+
+	/*
+	 * Grace period. This may waste several cpu cycles,
+	 * but it will complete eventually.
+	 */
+	while (refcount_read(&usage) > 1)
+		;
 
 	tracker_fini();
 
@@ -156,9 +154,9 @@ static void __exit switch_hook_module_exit(void)
 	if (krp_post.nmissed)
 		pr_info("Missed %u invocations\n", krp_post.nmissed);
 
-	system_hooked = 0;
+	shook_initialized = 0;
 
-	pr_info("module shutdown\n");
+	pr_info("Module unloaded\n");
 }
 
 module_init(switch_hook_module_init);
