@@ -32,7 +32,7 @@ void switch_hook_set_system_wide_mode(bool mode)
 EXPORT_SYMBOL(switch_hook_set_system_wide_mode);
 
 static int context_switch_entry_handler(struct kretprobe_instance *ri,
-					    struct pt_regs *regs)
+					struct pt_regs *regs)
 {
 	unsigned long *prev_address = (unsigned long *)ri->data;
 
@@ -42,7 +42,7 @@ static int context_switch_entry_handler(struct kretprobe_instance *ri,
 }
 
 static int context_switch_handler(struct kretprobe_instance *ri,
-				      struct pt_regs *regs)
+				  struct pt_regs *regs)
 {
 	struct task_struct *prev =
 		(struct task_struct *)*((unsigned long *)ri->data);
@@ -59,12 +59,9 @@ static int context_switch_handler(struct kretprobe_instance *ri,
 
 	if (system_wide_mode) {
 		((ctx_func *)ctx_hook)(prev, true, true);
-	} else if (use_pid_register_id) {
-		((ctx_func *)ctx_hook)(prev, query_tracker(prev->pid),
-				       query_tracker(current->pid));
 	} else {
-		((ctx_func *)ctx_hook)(prev, query_tracker(prev->pid),
-				       query_tracker(current->pid));
+		((ctx_func *)ctx_hook)(prev, query_tracker(prev),
+				       query_tracker(current));
 	}
 
 	refcount_dec(&usage);
@@ -136,7 +133,7 @@ static void __exit switch_hook_module_exit(void)
 		pr_err("Whoops. Module exit already called\n");
 		return;
 	}
-	
+
 	shook_enabled = 0;
 
 	/*
