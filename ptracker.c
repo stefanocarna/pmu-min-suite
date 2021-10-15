@@ -122,7 +122,7 @@ int tracker_add(struct task_struct *tsk)
 	tracked_count++;
 	spin_unlock_irqrestore(&lock, flags);
 
-	pr_info("Registered [%s] (PID: %u - TGID:%u) %s\n", tsk->comm, tsk->pid,
+	pr_debug("Registered [%s] (PID: %u - TGID:%u) %s\n", tsk->comm, tsk->pid,
 		tsk->tgid, exist ? "AGGREGATE" : "NEW");
 
 	return 0;
@@ -165,7 +165,7 @@ int tracker_del(struct task_struct *tsk)
 		if (!cur->counter)
 			kfree(cur);
 
-		pr_info("Unregistered [%s] (PID: %u - TGID:%u) %s\n", tsk->comm,
+		pr_debug("Unregistered [%s] (PID: %u - TGID:%u) %s\n", tsk->comm,
 			tsk->pid, tsk->tgid,
 			last_tracked ? "LAST" : "SOME MORE");
 	}
