@@ -9,3 +9,7 @@
 *.cmd
 *.order
 *.symvers
+
+#development files
+.clang-format
+.vscode/

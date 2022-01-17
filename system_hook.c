@@ -1,163 +1,134 @@
 #include <linux/kprobes.h>
 #include <linux/refcount.h>
 
-#include "ptracker.h"
 #include "system_hook.h"
 
-static bool shook_initialized = false;
-static bool shook_enabled = false;
-static bool system_wide_mode = false;
+bool shook_enabled;
+bool system_wide_mode;
+bool shook_initialized;
 
 /* Basic implementation of safe-unmount */
-static refcount_t usage = REFCOUNT_INIT(1);
-static refcount_t unmounting = REFCOUNT_INIT(1);
+refcount_t usage = REFCOUNT_INIT(1);
+refcount_t unmounting = REFCOUNT_INIT(1);
 
-static void dummy_ctx_func(struct task_struct *prev, bool prev_on, bool curr_on)
+
+void dummy_sched_in(ARGS_SCHED_IN)
 {
-	// Empty call
+}
+void dummy_proc_fork(ARGS_PROC_FORK)
+{
+}
+void dummy_proc_exit(ARGS_PROC_EXIT)
+{
+}
+void *dummy_on_attach(void *data)
+{
+	return NULL;
+}
+void *dummy_on_detach(void *data)
+{
+	return NULL;
 }
 
-static unsigned long *ctx_hook = (unsigned long *)dummy_ctx_func;
+bool start_handler(void)
+{
+	if (!shook_enabled)
+		return false;
 
-void switch_hook_set_state_enable(bool state)
+	/* Skip if unmounting */
+	if (refcount_read(&unmounting) > 1)
+		return false;
+
+	preempt_disable_notrace();
+	refcount_inc(&usage);
+	return true;
+}
+
+void stop_handler(void)
+{
+	refcount_dec(&usage);
+	preempt_enable_notrace();
+}
+
+void (*hook_sched_in)(ARGS_SCHED_IN) = dummy_sched_in;
+void (*hook_proc_fork)(ARGS_PROC_FORK) = dummy_proc_fork;
+void (*hook_proc_exit)(ARGS_PROC_EXIT) = dummy_proc_exit;
+/* Used when a new process is automatically attached */
+void *(*hook_on_attach)(void *data) = dummy_on_attach;
+void *(*hook_on_detach)(void *data) = dummy_on_detach;
+
+#define assign_hook(name, hook)                                                \
+	do {                                                                   \
+		if (hook)                                                      \
+			WRITE_ONCE(hook_##name, (typeof(hook_##name))hook);                         \
+		else                                                           \
+			WRITE_ONCE(hook_##name, dummy_##name);                 \
+	} while (0)
+
+__weak void set_shook_callback(unsigned long *hook, enum hook_type type)
+{
+	switch (type) {
+	case SCHED_IN:
+		assign_hook(sched_in, hook);
+		break;
+	case PROC_FORK:
+		assign_hook(proc_fork, hook);
+		break;
+	case PROC_EXIT:
+		assign_hook(proc_exit, hook);
+		break;
+	case ON_ATTACH:
+		assign_hook(on_attach, hook);
+		break;
+	case ON_DETACH:
+		assign_hook(on_detach, hook);
+		break;
+	default:
+		pr_err("Unhandled hook_type. Skip\n");
+	}
+}
+EXPORT_SYMBOL(set_shook_callback);
+
+__weak void switch_hook_set_state_enable(bool state)
 {
 	shook_enabled = state;
 }
 EXPORT_SYMBOL(switch_hook_set_state_enable);
 
-void switch_hook_set_system_wide_mode(bool mode)
+__weak void switch_hook_set_system_wide_mode(bool mode)
 {
 	system_wide_mode = mode;
 }
 EXPORT_SYMBOL(switch_hook_set_system_wide_mode);
 
-static int context_switch_entry_handler(struct kretprobe_instance *ri,
-					struct pt_regs *regs)
+__weak int register_fork_hook(void)
 {
-	unsigned long *prev_address = (unsigned long *)ri->data;
-
-	/* Take the reference to prev task */
-	*prev_address = regs->di;
+	return 0;
+}
+__weak int register_exit_hook(void)
+{
 	return 0;
 }
 
-static int context_switch_handler(struct kretprobe_instance *ri,
-				  struct pt_regs *regs)
+__weak void unregister_fork_hook(void)
 {
-	struct task_struct *prev =
-		(struct task_struct *)*((unsigned long *)ri->data);
+	/* Do nothing */
+}
+__weak void unregister_exit_hook(void)
+{
+	/* Do nothing */
+}
 
-	if (!shook_enabled)
-		goto end;
-
-	/* Skip if unmounting */
-	if (refcount_read(&unmounting) > 1)
-		goto end;
-
-	preempt_disable();
-	refcount_inc(&usage);
-
-	if (system_wide_mode) {
-		((ctx_func *)ctx_hook)(prev, true, true);
-	} else {
-		((ctx_func *)ctx_hook)(prev, query_tracker(prev),
-				       query_tracker(current));
-	}
-
-	refcount_dec(&usage);
-	preempt_enable();
-end:
+__weak int register_hook(enum hook_type type, void *func)
+{
 	return 0;
 }
 
-static struct kretprobe krp_post = { .handler = context_switch_handler,
-				     .entry_handler =
-					     context_switch_entry_handler,
-				     .data_size = sizeof(struct task_struct *),
-				     .maxactive = 8 + 1 };
-
-/**
- * TODO - Redefine 
- * This is an unsafe way to set the callback
- */
-void set_hook_callback(ctx_func *hook)
+__weak void unregister_hook(enum hook_type type, void *func)
 {
-	if (!hook) {
-		pr_warn("Hook is NULL. Setting default callback\n");
-		ctx_hook = (unsigned long *)dummy_ctx_func;
-	} else {
-		ctx_hook = (unsigned long *)hook;
-	}
-}
-EXPORT_SYMBOL(set_hook_callback);
-
-static __init int switch_hook_module_init(void)
-{
-	int err = 0;
-
-	/* Hook post function */
-	krp_post.kp.symbol_name = SWITCH_POST_FUNC;
-
-	err = register_kretprobe(&krp_post);
-	if (err) {
-		pr_warn("Cannot hook post function - ERR_CODE: %d\n", err);
-		goto post_err;
-	};
-
-	err = tracker_init();
-	if (err) {
-		pr_warn("Cannot init tracker - ERR_CODE: %d\n", err);
-		goto tracker_err;
-	};
-
-	shook_initialized = 1;
-
-	pr_info("Module loaded\n");
-	return 0;
-
-tracker_err:
-	unregister_kretprobe(&krp_post);
-
-post_err:
-	return err;
+	/* Do nothing */
 }
 
-static void __exit switch_hook_module_exit(void)
-{
-	if (!shook_initialized) {
-		pr_err("Whoops. The system is not hooked\n");
-		return;
-	}
-
-	if (!refcount_inc_not_zero(&unmounting)) {
-		pr_err("Whoops. Module exit already called\n");
-		return;
-	}
-
-	shook_enabled = 0;
-
-	/*
-	 * Grace period. This may waste several cpu cycles,
-	 * but it will complete eventually.
-	 */
-	while (refcount_read(&usage) > 1)
-		;
-
-	tracker_fini();
-
-	unregister_kretprobe(&krp_post);
-
-	/* nmissed > 0 suggests that maxactive was set too low. */
-	if (krp_post.nmissed)
-		pr_info("Missed %u invocations\n", krp_post.nmissed);
-
-	shook_initialized = 0;
-
-	pr_info("Module unloaded\n");
-}
-
-module_init(switch_hook_module_init);
-module_exit(switch_hook_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Stefano Carna'");
